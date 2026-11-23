@@ -1,0 +1,17 @@
+# Gerado pelo Airflow em execução (logs das tasks, do scheduler e do processador de DAGs)
+logs/
+
+# Cache do Python
+__pycache__/
+*.pyc
+
+# Segredos e ambientes locais
+.env
+.venv/
+venv/
+
+# Editor e sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
