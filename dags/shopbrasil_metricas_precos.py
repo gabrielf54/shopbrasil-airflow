@@ -60,7 +60,10 @@ def shopbrasil_metricas_precos():
 
         @task(
             # A API oscila de madrugada: tenta 5 vezes no total, esperando
-            # cada vez mais (30s, 1min, 2min, 4min), até no máximo 10 minutos.
+            # cada vez mais. A base dobra a cada falha (30s, 1min, 2min, 4min)
+            # e o Airflow sorteia a espera real entre 1x e 2x a base, até no
+            # máximo 10 minutos. O sorteio evita que vários clientes voltem
+            # todos ao mesmo tempo.
             retries=4,
             retry_delay=timedelta(seconds=30),
             retry_exponential_backoff=True,

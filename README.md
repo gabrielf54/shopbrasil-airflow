@@ -133,7 +133,7 @@ SELECT data_referencia, count(*) FROM metricas_categoria GROUP BY 1;
 
 **Fuso ancorado no `start_date`.** O cron `0 6 * * *` é interpretado no fuso do `start_date` (`pendulum.datetime(..., tz="America/Sao_Paulo")`). Sem isso, o Airflow usaria UTC e a DAG rodaria às 03:00 de Brasília. Como o Brasil não tem horário de verão desde 2019, 06:00 de Brasília é sempre 09:00 UTC.
 
-**Backoff calmo, com teto.** São 4 retries (5 tentativas no total), começando em 30s e dobrando a cada falha, até no máximo 10 minutos. No pior caso, o pipeline desiste uns 8 minutos depois da primeira falha e avisa, bem antes de o time chegar. O `execution_timeout` de 2 minutos impede que uma conexão pendurada segure a task para sempre.
+**Backoff calmo, com teto.** São 4 retries (5 tentativas no total). A espera base começa em 30s e dobra a cada falha, e o Airflow sorteia a espera real entre 1x e 2x a base, com teto de 10 minutos. O sorteio evita que vários clientes voltem à API todos no mesmo instante. Num teste com a API fora do ar, as esperas foram de 35s, 1min56, 2min33 e 7min54: o pipeline desistiu e alertou cerca de 13 minutos depois da primeira falha, bem antes de o time chegar. O `execution_timeout` de 2 minutos impede que uma conexão pendurada segure a task para sempre.
 
 **Validação que descarta, mas não esconde.** O `ValidarProdutosOperator` descarta produtos com schema inválido (registrando cada um no log) em vez de derrubar a execução por um item quebrado. Se não sobrar nenhum produto válido, ele falha, porque aí o problema é a API e não um produto.
 
