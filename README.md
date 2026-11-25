@@ -1,17 +1,12 @@
-# ShopBrasil: métricas de preço por categoria com Apache Airflow
+# ShopBrasil - métricas de preço por categoria com Airflow
 
-Atividade 01 da disciplina **Orquestração de Workflows** (pós-graduação em Engenharia de IA e MLOps, PUC Minas).
+Atividade 01 de Orquestração de Workflows (pós em Engenharia de IA e MLOps, PUC Minas).
 
-## O problema
+## Contexto
 
-Todas as manhãs, o time de pricing e os gerentes de categoria da ShopBrasil abrem um painel com preço médio, mínimo, máximo e quantidade de produtos por categoria para decidir as promoções do dia. Esse painel era alimentado por um script Python no cron, que tinha quatro problemas:
+O time de pricing da ShopBrasil abre todo dia de manhã um painel com preço médio, mínimo, máximo e quantidade de produtos por categoria. Esse painel era alimentado por um script Python no cron, que falhava em silêncio quando a API caía, duplicava os dados quando alguém rodava de novo na mão e precisava ser editado a cada categoria nova.
 
-| Problema do script no cron | Como o pipeline resolve |
-|---|---|
-| A API oscila de madrugada e o script falha em silêncio | Retry com exponential backoff e alerta quando as tentativas acabam |
-| Rodar de novo "na mão" duplica os números no banco | Gravação idempotente (upsert por dia e categoria) |
-| Cada categoria nova exige editar o código | Dynamic Task Mapping: uma task por categoria, criada em tempo de execução |
-| Ninguém sabe o que rodou nem quando | UI do Airflow com o histórico de cada execução, tentativa e log |
+Este projeto troca o script por uma DAG no Airflow que roda às 06:00 (horário de Brasília), tenta de novo quando a API falha, cria uma task por categoria automaticamente e grava no Postgres sem duplicar.
 
 ## Arquitetura
 
@@ -20,7 +15,7 @@ flowchart LR
     API[(FakeStore API)] --> B
 
     subgraph ingestao
-        B[buscar_produtos<br/>retry + backoff + callbacks] --> V[validar_produtos<br/>ValidarProdutosOperator] --> A[agrupar_por_categoria]
+        B[buscar_produtos] --> V[validar_produtos] --> A[agrupar_por_categoria]
     end
 
     subgraph analise
@@ -32,40 +27,25 @@ flowchart LR
     end
 
     subgraph persistencia
-        C --> S[salvar_snapshot<br/>upsert idempotente]
-        C --> H[salvar_historico<br/>append]
+        C --> S[salvar_snapshot]
+        C --> H[salvar_historico]
     end
 
-    S --> PG[(PostgreSQL<br/>analytics)]
+    S --> PG[(PostgreSQL)]
     H --> PG
 ```
 
-As três topologias pedidas aparecem assim na DAG:
+- **Linear:** buscar_produtos -> validar_produtos -> agrupar_por_categoria
+- **Fan-out:** `calcular_metricas.expand(...)` cria uma task por categoria (hoje são 4)
+- **Fan-in:** `consolidar` junta o resultado de todas
 
-- **Linear:** `buscar_produtos → validar_produtos → agrupar_por_categoria`.
-- **Fan-out:** `calcular_metricas.expand(...)` cria uma instância por categoria. Hoje a API tem 4 categorias, mas se aparecer uma quinta, ela ganha uma task sozinha.
-- **Fan-in:** `consolidar` recebe a lista com o resultado de todas as instâncias.
+O `docker-compose.yml` sobe dois Postgres: um é o banco interno do Airflow e o outro (`postgres-analytics`) é a base onde o pipeline grava. O `airflow-init` roda uma vez para criar o usuário, a connection `postgres_shopbrasil` e o pool `ecommerce_pool`. Depois ficam rodando o scheduler e o webserver.
 
-### Containers
+A base tem duas tabelas: `metricas_categoria` (uma linha por categoria por dia) e `historico_metricas_categoria` (acrescenta linhas a cada execução).
 
-| Serviço | Papel |
-|---|---|
-| `postgres-meta` | Banco interno do Airflow (runs, estados, XComs, connections, pools) |
-| `postgres-analytics` | Base analítica da ShopBrasil, onde o pipeline grava |
-| `airflow-init` | Roda uma vez: migra o banco, cria o usuário, a connection `postgres_shopbrasil` e o pool `ecommerce_pool` |
-| `airflow-scheduler` | Agenda e executa as tasks (LocalExecutor) |
-| `airflow-webserver` | Interface em http://localhost:8080 |
+## Como rodar
 
-### Tabelas
-
-| Tabela | Modo | Chave |
-|---|---|---|
-| `metricas_categoria` | Snapshot idempotente: uma linha por categoria por dia | `PRIMARY KEY (data_referencia, categoria)` |
-| `historico_metricas_categoria` | Append: uma linha por categoria a cada coleta | `id` sequencial |
-
-## Como executar
-
-Pré-requisito: Docker Desktop (ou Docker Engine com Compose v2), com uns 4 GB de RAM livres.
+Precisa de Docker com Compose v2.
 
 ```bash
 git clone https://github.com/gabrielf54/shopbrasil-airflow.git
@@ -75,84 +55,63 @@ docker compose up -d
 
 No Linux/macOS, antes do `up`: `mkdir -p logs && chmod -R 777 logs`.
 
-Na primeira vez, o Docker baixa as imagens (2 a 3 minutos). Depois:
+Na primeira vez demora uns minutos para baixar as imagens. Depois é só abrir http://localhost:8080 (`admin` / `admin`). A DAG `shopbrasil_metricas_precos` já sobe ligada e roda a execução do dia logo em seguida.
 
-1. Abra http://localhost:8080 e entre com `admin` / `admin`.
-2. A DAG `shopbrasil_metricas_precos` já nasce ligada. Como o último horário das 06:00 já passou, o scheduler dispara a execução daquele dia logo em seguida.
-3. Acompanhe pelo **Grid** e pelo **Graph**. As instâncias mapeadas aparecem com o nome da categoria.
-
-Para consultar o resultado:
+Para ver o resultado no banco:
 
 ```bash
 docker compose exec postgres-analytics psql -U shopbrasil -d analytics \
   -c "SELECT * FROM metricas_categoria ORDER BY data_referencia DESC, categoria;"
 ```
 
-Ou conecte um cliente SQL em `localhost:5434` (usuário `shopbrasil`, senha `shopbrasil123`, banco `analytics`).
+O banco também fica exposto em `localhost:5434` (`shopbrasil` / `shopbrasil123`, banco `analytics`).
 
-Para derrubar: `docker compose down` mantém os dados, e `docker compose down -v` apaga os bancos.
+`docker compose down` para tudo e mantém os dados; `docker compose down -v` apaga os bancos.
 
-## Como testar os requisitos
+## Como testar
 
-**Idempotência.** Rode a mesma execução de novo (no Grid: selecione a run → *Clear*) ou dispare uma execução manual (*Trigger DAG*). A contagem de `metricas_categoria` continua igual, e só `dag_run_id` e `atualizado_em` mudam:
+**Idempotência:** rode a mesma execução de novo (Clear no Grid) ou dispare manualmente. O número de linhas em `metricas_categoria` não muda, só o `dag_run_id` e o `atualizado_em`.
 
 ```sql
 SELECT data_referencia, count(*) FROM metricas_categoria GROUP BY 1;
 ```
 
-**Retry, backoff e alerta.** Em *Admin → Variables*, crie `fakestore_api_url` com um endereço inválido, por exemplo `https://fakestoreapi.com/fora-do-ar`, e dispare a DAG. A task `buscar_produtos` falha, avisa no log (`🔁 ... falhou na tentativa 1`) e tenta de novo com espera crescente. Para ver a recuperação, apague a Variable antes da última tentativa. Para ver o alerta, deixe as 5 tentativas falharem: o log da última mostra `ALERTA ENVIADO (simulado)` com a mensagem que iria para o canal do time.
+**Retry e alerta:** em Admin > Variables, crie `fakestore_api_url` com um endereço inválido (ex.: `https://fakestoreapi.com/fora-do-ar`) e dispare a DAG. O log de `buscar_produtos` mostra `[RETRY]` a cada tentativa. Se apagar a Variable antes da última tentativa, a task se recupera. Se deixar as 5 tentativas falharem, a última mostra o `[ALERTA]`.
 
-**Pool.** No Gantt de uma execução, as 4 instâncias de `calcular_metricas` rodam no máximo 2 ao mesmo tempo. O pool aparece em *Admin → Pools*.
+**Pool:** no Gantt de uma execução dá para ver que só 2 `calcular_metricas` rodam ao mesmo tempo.
 
 ## Onde está cada requisito
 
 | Requisito | Onde |
 |---|---|
-| TaskFlow API (`@dag`/`@task`), dependências pela chamada das funções | `dags/shopbrasil_metricas_precos.py`, última linha da DAG: `persistencia(analise(ingestao()))` |
-| XComs automáticos via `return`, só com dados pequenos | `buscar_produtos` devolve só `id`, `title`, `category` e `price` |
-| Linear, fan-out e fan-in | Grupos `ingestao` e `analise` |
-| 06:00 em `America/Sao_Paulo`, pendulum, `start_date`, `catchup=False` | Decorador `@dag` |
-| Retry com exponential backoff | `@task` de `buscar_produtos` |
-| `try/except` + `raise` | Corpo de `buscar_produtos` |
-| Callbacks de sucesso, retry e falha | `plugins/shopbrasil/callbacks.py`, ligados em `buscar_produtos` |
+| TaskFlow (`@dag`/`@task`) e dependências pela chamada das funções | `dags/shopbrasil_metricas_precos.py`, linha `persistencia(analise(ingestao()))` |
+| XCom via `return`, só dados pequenos | `buscar_produtos` devolve só `id`, `title`, `category` e `price` |
+| Linear, fan-out e fan-in | grupos `ingestao` e `analise` |
+| 06:00 em `America/Sao_Paulo` com pendulum, `catchup=False` | decorador `@dag` |
+| Retry com exponential backoff, `try/except` + `raise` | `buscar_produtos` |
+| Callbacks de sucesso, retry e falha | `plugins/shopbrasil/callbacks.py` |
 | Dynamic Task Mapping | `calcular_metricas.expand(lote=lotes)` |
-| Pool `ecommerce_pool` com 2 slots | Criado no `airflow-init` (`docker-compose.yml`) e usado em `@task(pool=...)` |
-| 2 ou mais TaskGroups | `ingestao`, `analise` e `persistencia` |
-| PostgresHook + Connection, gravação idempotente | `salvar_snapshot`, com a connection `postgres_shopbrasil` |
-| *Opcional:* operador customizado | `plugins/shopbrasil/operators.py` (`ValidarProdutosOperator`) |
-| *Opcional:* tabela de histórico | `salvar_historico` → `historico_metricas_categoria` |
-| *Opcional:* alerta | `alertar_falha`, `on_failure_callback` de todas as tasks |
+| Pool `ecommerce_pool` (2 slots) | criado no `airflow-init`, usado em `calcular_metricas` |
+| TaskGroups | `ingestao`, `analise` e `persistencia` |
+| PostgresHook + Connection, gravação idempotente | `salvar_snapshot` |
+| Opcional: operador customizado | `plugins/shopbrasil/operators.py` |
+| Opcional: tabela de histórico | `salvar_historico` |
+| Opcional: alerta | `alertar_falha` (`on_failure_callback`) |
 
-## Decisões técnicas
+## Decisões
 
-**Upsert com chave natural para a idempotência.** O snapshot tem chave primária `(data_referencia, categoria)`, e a gravação usa `INSERT ... ON CONFLICT DO UPDATE`. Rodar de novo atualiza as linhas do dia em vez de criar outras. Na mesma transação, a task apaga do dia as categorias que sumiram do catálogo, para o snapshot refletir exatamente a última coleta. Se algo falhar no meio, o rollback deixa o dia como estava.
+A idempotência vem da chave primária `(data_referencia, categoria)` com `INSERT ... ON CONFLICT DO UPDATE`. Se rodar de novo, atualiza as linhas do dia em vez de criar outras. A `data_referencia` sai do `data_interval_end` da run e não do `NOW()`, assim reprocessar um dia antigo grava naquele dia e não no dia de hoje.
 
-**`data_referencia` vem do intervalo da run, não do relógio.** A data é a do fim do intervalo, no fuso de Brasília: a run agendada de hoje às 06:00 cobre `[ontem 06:00, hoje 06:00]` e grava como hoje. Uma execução manual no mesmo dia cai no mesmo intervalo e, portanto, na mesma data, por isso substitui o snapshot em vez de duplicar. Usar `NOW()` faria um reprocessamento de ontem gravar como hoje.
+O fuso fica no `start_date` com pendulum porque o Airflow interpreta o cron no fuso do `start_date`. Sem isso a DAG rodaria às 06:00 UTC, que são 03:00 em Brasília.
 
-**O histórico é append de propósito.** A tabela de histórico registra cada coleta como uma observação, com `coletado_em` e `dag_run_id`. Repetir uma execução acrescenta linhas, e isso é desejado: o objetivo é acompanhar a evolução dos preços. A deduplicação, quando precisar, é feita na consulta.
+No retry usei 4 retries com backoff começando em 30s e teto de 10 minutos. Num teste com a API fora do ar as esperas foram 35s, 1min56, 2min33 e 7min54, e o alerta saiu uns 13 minutos depois da primeira falha.
 
-**Fuso ancorado no `start_date`.** O cron `0 6 * * *` é interpretado no fuso do `start_date` (`pendulum.datetime(..., tz="America/Sao_Paulo")`). Sem isso, o Airflow usaria UTC e a DAG rodaria às 03:00 de Brasília. Como o Brasil não tem horário de verão desde 2019, 06:00 de Brasília é sempre 09:00 UTC.
+O histórico é append de propósito, porque a ideia é ver como os preços mudam ao longo do tempo. Ali repetir uma execução gera linhas novas.
 
-**Backoff calmo, com teto.** São 4 retries (5 tentativas no total). A espera base começa em 30s e dobra a cada falha, e o Airflow sorteia a espera real entre 1x e 2x a base, com teto de 10 minutos. O sorteio evita que vários clientes voltem à API todos no mesmo instante. Num teste com a API fora do ar, as esperas foram de 35s, 1min56, 2min33 e 7min54: o pipeline desistiu e alertou cerca de 13 minutos depois da primeira falha, bem antes de o time chegar. O `execution_timeout` de 2 minutos impede que uma conexão pendurada segure a task para sempre.
+Não fiz imagem customizada: a imagem oficial do Airflow 2.9.3 já tem o provider do Postgres e o `requests`, e as métricas são só média, mínimo e máximo, então não precisei de pandas.
 
-**Validação que descarta, mas não esconde.** O `ValidarProdutosOperator` descarta produtos com schema inválido (registrando cada um no log) em vez de derrubar a execução por um item quebrado. Se não sobrar nenhum produto válido, ele falha, porque aí o problema é a API e não um produto.
+## Limitações
 
-**Callbacks e operador em `plugins/`.** A pasta `plugins/` entra no `sys.path` do Airflow. Deixar ali o código reutilizável mantém em `dags/` só a definição do fluxo.
-
-**Sem imagem customizada.** A imagem oficial `apache/airflow:2.9.3-python3.11` já traz o provider do Postgres, `requests` e `pendulum`. As métricas são calculadas em Python puro, então o projeto não precisa de pandas nem de um `Dockerfile` próprio, e sobe mais rápido.
-
-**`max_active_runs=1`.** Duas execuções simultâneas disputariam as mesmas linhas do snapshot, por isso só uma roda por vez.
-
-## Estrutura
-
-```
-shopbrasil-airflow/
-├── docker-compose.yml               ambiente completo (Airflow + 2 Postgres)
-├── dags/
-│   └── shopbrasil_metricas_precos.py
-├── plugins/shopbrasil/
-│   ├── callbacks.py                 sucesso, retry e alerta de falha
-│   └── operators.py                 ValidarProdutosOperator
-└── sql/
-    └── init.sql                     tabelas da base analítica
-```
+- O alerta é simulado: só escreve a mensagem no log. O próximo passo seria mandar para um webhook do Slack.
+- As senhas estão fixas no `docker-compose.yml` para o projeto subir com um comando só. O certo seria usar um `.env`.
+- Se a API ficar fora do ar o dia todo, não existe cache: o snapshot do dia não é gravado e o painel fica com os dados do dia anterior.

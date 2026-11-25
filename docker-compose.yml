@@ -1,35 +1,9 @@
-# =============================================================================
-# ShopBrasil: pipeline de métricas de preço por categoria
-# Apache Airflow 2.9 + PostgreSQL (banco interno do Airflow + base analítica)
-# =============================================================================
-#
-# SERVIÇOS:
-#   postgres-meta      banco INTERNO do Airflow (runs, estado das tasks, XComs,
-#                      connections, pools). O pipeline não grava nada aqui.
-#   postgres-analytics base ANALÍTICA da ShopBrasil: é onde o pipeline grava as
-#                      métricas que alimentam o painel do time de pricing.
-#   airflow-init       roda UMA vez e encerra: migra o banco interno, cria o
-#                      usuário admin, a connection "postgres_shopbrasil" e o
-#                      pool "ecommerce_pool" (2 slots).
-#   airflow-scheduler  lê ./dags, agenda as execuções e executa as tasks.
-#   airflow-webserver  interface web: http://localhost:8080
-#
-# SUBIR DO ZERO:
-#   docker compose up -d
-#   (Linux/macOS, antes: mkdir -p logs && chmod -R 777 logs)
-#
-# ACESSO:
-#   Airflow UI ......... http://localhost:8080   (admin / admin)
-#   Base analítica ..... localhost:5434  (shopbrasil / shopbrasil123 / analytics)
-#
-# As senhas ficam fixas aqui porque é um projeto de estudo que precisa subir
-# com um comando só. Em produção elas viriam de um .env ou de um secrets manager.
-# =============================================================================
+# ShopBrasil - Airflow 2.9 + Postgres
+# Subir: docker compose up -d  |  UI: http://localhost:8080 (admin/admin)
+# Senhas fixas por ser projeto de estudo (em produção iriam para um .env).
 
 x-airflow-common: &airflow-common
-  # Mesma versão usada nos labs da disciplina. A imagem oficial já traz o
-  # provider do Postgres (PostgresHook), requests e pendulum, então não
-  # precisamos instalar nada extra.
+  # mesma versão dos labs; já vem com o provider do Postgres
   image: apache/airflow:2.9.3-python3.11
 
   environment: &airflow-common-env
@@ -39,25 +13,21 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__SECRET_KEY: "shopbrasil-secret-key"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
 
-    # A DAG nasce LIGADA: o pipeline precisa rodar sozinho às 06:00 sem
-    # ninguém entrar na UI para despausar.
+    # DAG já nasce ligada, sem precisar despausar na UI
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
 
-    # Horário de Brasília como padrão do Airflow e da interface.
-    # (O agendamento da DAG também ancora o fuso no start_date, com pendulum.)
     AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
     AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: America/Sao_Paulo
 
-    # Procura arquivos novos em ./dags a cada 30s (o padrão é 5 minutos).
+    # procura DAG nova a cada 30s (padrão é 5 min)
     AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
 
-    # Endereço da API de catálogo. Pode ser sobrescrito pela Variable
-    # "fakestore_api_url" na UI (útil para simular a API fora do ar).
+    # dá para sobrescrever pela Variable fakestore_api_url (teste de falha)
     FAKESTORE_API_URL: https://fakestoreapi.com
 
   volumes:
     - ./dags:/opt/airflow/dags
-    - ./plugins:/opt/airflow/plugins    # operador customizado e callbacks
+    - ./plugins:/opt/airflow/plugins
     - ./logs:/opt/airflow/logs
 
   depends_on:
@@ -95,10 +65,10 @@ services:
       POSTGRES_DB: analytics
     volumes:
       - postgres-analytics-data:/var/lib/postgresql/data
-      # Roda só na PRIMEIRA vez que o volume é criado: cria as tabelas.
+      # só roda quando o volume é criado
       - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      # 5434 para não conflitar com um Postgres local (5432) nem com o lab (5433).
+      # 5434 para não bater com o Postgres local nem com o do lab
       - "5434:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "shopbrasil", "-d", "analytics"]
@@ -120,20 +90,17 @@ services:
 
         airflow users create --username admin --password admin \
           --firstname Admin --lastname ShopBrasil --role Admin \
-          --email admin@shopbrasil.local || true   # já existe numa 2ª subida
+          --email admin@shopbrasil.local || true
 
-        # Connection usada pelo PostgresHook. Apaga e recria para que rodar o
-        # init de novo não falhe e sempre deixe a connection correta.
+        # apaga e recria para o init poder rodar de novo sem erro
         airflow connections delete postgres_shopbrasil > /dev/null 2>&1 || true
         airflow connections add postgres_shopbrasil \
           --conn-type postgres --conn-host postgres-analytics --conn-port 5432 \
           --conn-login shopbrasil --conn-password shopbrasil123 --conn-schema analytics
 
-        # Pool que limita a 2 as tasks mapeadas rodando ao mesmo tempo.
-        # "pools set" cria ou atualiza: é idempotente.
         airflow pools set ecommerce_pool 2 "Limita a concorrência do cálculo por categoria"
 
-        echo "=== Airflow inicializado. Acesse http://localhost:8080 (admin/admin) ==="
+        echo "init ok"
     depends_on:
       postgres-meta:
         condition: service_healthy

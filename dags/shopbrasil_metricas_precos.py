@@ -1,19 +1,13 @@
 """
-### ShopBrasil: métricas de preço por categoria
+### ShopBrasil - métricas de preço por categoria
 
-Substitui o script do cron que alimentava o painel de pricing. Todo dia às
-06:00 (Brasília), coleta o catálogo da API, calcula preço médio, mínimo,
-máximo e quantidade de produtos por categoria e grava na base analítica.
+Roda todo dia às 06:00 (Brasília): busca o catálogo na API, calcula preço
+médio, mínimo, máximo e quantidade por categoria e grava no Postgres.
 
-```
-ingestao:     buscar_produtos → validar_produtos → agrupar_por_categoria     (linear)
-analise:      calcular_metricas[categoria 1..N]                              (fan-out)
-              → consolidar                                                   (fan-in)
-persistencia: salvar_snapshot (upsert, idempotente) e salvar_historico (append)
-```
+- ingestao: buscar_produtos -> validar_produtos -> agrupar_por_categoria
+- analise: calcular_metricas (uma por categoria) -> consolidar
+- persistencia: salvar_snapshot (upsert) e salvar_historico (append)
 """
-
-from __future__ import annotations
 
 import logging
 import os
@@ -39,31 +33,26 @@ API_PADRAO = os.getenv("FAKESTORE_API_URL", "https://fakestoreapi.com")
 
 @dag(
     dag_id="shopbrasil_metricas_precos",
-    # 06:00 todo dia. O cron é lido no fuso do start_date (America/Sao_Paulo),
-    # e não em UTC: sem isso, rodaria às 03:00 de Brasília.
+    # o cron usa o fuso do start_date; sem o tz rodaria 06:00 UTC (03:00 aqui)
     schedule="0 6 * * *",
     start_date=pendulum.datetime(2026, 11, 1, tz=TZ),
-    catchup=False,           # ao ligar a DAG, não reprocessa os dias passados
-    max_active_runs=1,       # duas runs ao mesmo tempo disputariam as mesmas linhas
+    catchup=False,
+    max_active_runs=1,
     default_args={
         "owner": "time-dados",
-        "on_failure_callback": alertar_falha,   # qualquer task que falhe de vez alerta
+        "on_failure_callback": alertar_falha,
     },
     tags=["shopbrasil", "pricing", "atividade-01"],
     doc_md=__doc__,
 )
 def shopbrasil_metricas_precos():
 
-    # ------------------------------------------------------------- ingestão
+    # --- ingestão ---
     @task_group(group_id="ingestao")
     def ingestao():
 
+        # 5 tentativas no total, espera começando em 30s e dobrando (teto de 10 min)
         @task(
-            # A API oscila de madrugada: tenta 5 vezes no total, esperando
-            # cada vez mais. A base dobra a cada falha (30s, 1min, 2min, 4min)
-            # e o Airflow sorteia a espera real entre 1x e 2x a base, até no
-            # máximo 10 minutos. O sorteio evita que vários clientes voltem
-            # todos ao mesmo tempo.
             retries=4,
             retry_delay=timedelta(seconds=30),
             retry_exponential_backoff=True,
@@ -78,16 +67,16 @@ def shopbrasil_metricas_precos():
             url = f"{base.rstrip('/')}/products"
             try:
                 resposta = requests.get(url, timeout=15)
-                resposta.raise_for_status()      # 4xx/5xx viram exceção
+                resposta.raise_for_status()
                 produtos = resposta.json()
                 if not isinstance(produtos, list) or not produtos:
                     raise ValueError("a API devolveu um catálogo vazio ou fora do formato")
             except (requests.RequestException, ValueError) as erro:
                 log.error("Falha ao buscar o catálogo em %s: %s", url, erro)
-                raise    # relança: é a exceção que faz o Airflow agendar o retry
+                raise
 
             log.info("%d produtos recebidos da API", len(produtos))
-            # XCom guarda só o necessário (sem descrição, imagem, rating).
+            # só os campos usados, para o XCom ficar pequeno
             campos = ("id", "title", "category", "price")
             return [{c: p.get(c) for c in campos} for p in produtos]
 
@@ -98,9 +87,7 @@ def shopbrasil_metricas_precos():
 
         @task
         def agrupar_por_categoria(produtos: list[dict]) -> list[dict]:
-            """Um item por categoria. O tamanho dessa lista define quantas
-            tasks o fan-out vai criar: categoria nova = task nova, sem mexer
-            no código."""
+            # cada item vira uma task no expand, então categoria nova = task nova
             precos_por_categoria: dict[str, list[float]] = {}
             for p in produtos:
                 precos_por_categoria.setdefault(p["category"], []).append(p["price"])
@@ -113,14 +100,12 @@ def shopbrasil_metricas_precos():
 
         return agrupar_por_categoria(validar.output)
 
-    # -------------------------------------------------------------- análise
+    # --- análise ---
     @task_group(group_id="analise")
     def analise(lotes):
 
-        @task(
-            pool=POOL,                          # no máximo 2 rodando ao mesmo tempo
-            map_index_template="{{ categoria }}",  # a UI mostra o nome, não 0, 1, 2...
-        )
+        # map_index_template: mostra o nome da categoria na UI em vez de 0, 1, 2...
+        @task(pool=POOL, map_index_template="{{ categoria }}")
         def calcular_metricas(lote: dict) -> dict:
             get_current_context()["categoria"] = lote["categoria"]
             precos = lote["precos"]
@@ -142,23 +127,17 @@ def shopbrasil_metricas_precos():
                 )
             return resultado
 
-        # .expand cria uma instância de calcular_metricas por item de `lotes`
         return consolidar(calcular_metricas.expand(lote=lotes))
 
-    # --------------------------------------------------------- persistência
+    # --- persistência ---
     @task_group(group_id="persistencia")
     def persistencia(metricas):
 
         @task
         def salvar_snapshot(metricas: list[dict], data_interval_end=None, run_id=None) -> int:
-            """Grava o snapshot do dia de forma idempotente.
-
-            A chave é (data_referencia, categoria). Rodar de novo a mesma run
-            (ou outra run do mesmo dia) ATUALIZA as linhas em vez de duplicar.
-            Tudo numa transação só: ou grava o dia inteiro, ou nada.
-            """
-            # Dia do painel: a data, em Brasília, do fim do intervalo da run.
-            # A run agendada de hoje 06:00 cobre [ontem 06:00, hoje 06:00].
+            # A run das 06:00 de hoje cobre [ontem 06:00, hoje 06:00], então a
+            # data de referência é a de hoje. Rodar de novo cai na mesma data e
+            # o upsert atualiza as linhas em vez de duplicar.
             data_ref = data_interval_end.in_timezone(TZ).date()
             linhas = [
                 (data_ref, m["categoria"], m["qtd_produtos"], m["preco_medio"],
@@ -178,14 +157,14 @@ def shopbrasil_metricas_precos():
                     dag_run_id    = EXCLUDED.dag_run_id,
                     atualizado_em = NOW()
             """
-            # Categoria que sumiu do catálogo não pode ficar no snapshot do dia.
+            # se uma categoria sumiu da API, tira ela do snapshot do dia
             remover_ausentes = """
                 DELETE FROM metricas_categoria
                 WHERE data_referencia = %s AND NOT (categoria = ANY(%s))
             """
             conn = PostgresHook(postgres_conn_id=CONN_ID).get_conn()
             try:
-                with conn, conn.cursor() as cur:    # commit no fim; rollback se der erro
+                with conn, conn.cursor() as cur:  # uma transação só
                     cur.executemany(upsert, linhas)
                     cur.execute(remover_ausentes, (data_ref, [m["categoria"] for m in metricas]))
             finally:
@@ -196,7 +175,6 @@ def shopbrasil_metricas_precos():
 
         @task
         def salvar_historico(metricas: list[dict], data_interval_end=None, run_id=None) -> int:
-            """Acrescenta uma observação por categoria (modo append)."""
             data_ref = data_interval_end.in_timezone(TZ).date()
             hook = PostgresHook(postgres_conn_id=CONN_ID)
             hook.insert_rows(
@@ -215,8 +193,6 @@ def shopbrasil_metricas_precos():
         salvar_snapshot(metricas)
         salvar_historico(metricas)
 
-    # ----------------------------------------------------- fluxo principal
-    # As dependências saem da passagem de valores entre as chamadas.
     persistencia(analise(ingestao()))
 
 
