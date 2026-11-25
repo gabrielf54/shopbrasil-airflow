@@ -45,15 +45,13 @@ A base tem duas tabelas: `metricas_categoria` (uma linha por categoria por dia) 
 
 ## Como rodar
 
-Precisa de Docker com Compose v2.
+Precisa de Docker com Compose v2 e das portas 8080 (UI do Airflow) e 5434 (Postgres) livres.
 
 ```bash
 git clone https://github.com/gabrielf54/shopbrasil-airflow.git
 cd shopbrasil-airflow
 docker compose up -d
 ```
-
-No Linux/macOS, antes do `up`: `mkdir -p logs && chmod -R 777 logs`.
 
 Na primeira vez demora uns minutos para baixar as imagens. Depois é só abrir http://localhost:8080 (`admin` / `admin`). A DAG `shopbrasil_metricas_precos` já sobe ligada e roda a execução do dia logo em seguida.
 

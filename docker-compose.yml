@@ -28,7 +28,9 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./plugins:/opt/airflow/plugins
-    - ./logs:/opt/airflow/logs
+    # volume nomeado: o Docker cria já com o dono do Airflow (uid 50000),
+    # sem precisar de chmod na pasta no Linux
+    - airflow-logs:/opt/airflow/logs
 
   depends_on:
     postgres-meta:
@@ -142,6 +144,7 @@ services:
 volumes:
   postgres-meta-data:
   postgres-analytics-data:
+  airflow-logs:
 
 networks:
   shopbrasil-net:
